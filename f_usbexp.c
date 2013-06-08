@@ -83,7 +83,7 @@ static struct usb_interface usbexp_interface_desc = {
 
 static struct usb_endpoint_descriptor usbexp_highspeed_in_desc = {
 	.bLength		= USB_DT_ENDPOINT_SIZE,
-	.bDescriptorType	= USB_DT_ENDPOINT, 
+	.bDescriptorType	= USB_DT_ENDPOINT,
 	.bEndpointAddress	= USB_DIR_IN,
 	.bmAttributes		= USB_ENDPOINT_XFER_BULK,
 	.wMaxPacketSize		= __constant_cpu_to_le16(512),
@@ -91,7 +91,7 @@ static struct usb_endpoint_descriptor usbexp_highspeed_in_desc = {
 
 static struct usb_endpoint_descriptor usbexp_highspeed_out_desc = {
 	.bLength		= USB_DT_ENDPOINT_SIZE,
-	.bDescriptorType	= USB_DT_ENDPOINT, 
+	.bDescriptorType	= USB_DT_ENDPOINT,
 	.bEndpointAddress	= USB_DIR_OUT,
 	.bmAttributes		= USB_ENDPOINT_XFER_BULK,
 	.wMaxPacketSize		= __constant_cpu_to_le16(512),
@@ -100,14 +100,14 @@ static struct usb_endpoint_descriptor usbexp_highspeed_out_desc = {
 
 static struct usb_endpoint_descriptor usbexp_fullspeed_in_desc = {
 	.bLength		= USB_DT_ENDPOINT_SIZE,
-	.bDescriptorType	= USB_DT_ENDPOINT, 
+	.bDescriptorType	= USB_DT_ENDPOINT,
 	.bEndpointAddress	= USB_DIR_IN,
 	.bmAttributes		= USB_ENDPOINT_XFER_BULK,
 };
 
 static struct usb_endpoint_descriptor usbexp_fullspeed_out_desc = {
 	.bLength		= USB_DT_ENDPOINT_SIZE,
-	.bDescriptorType	= USB_DT_ENDPOINT, 
+	.bDescriptorType	= USB_DT_ENDPOINT,
 	.bEndpointAddress	= USB_DIR_OUT,
 	.bmAttributes		= USB_ENDPOINT_XFER_BULK,
 };
@@ -150,7 +150,7 @@ static struct usb_request *usbexp_request_new(struct usb_ep *ep, int buffer_size
 	return req;
 }
 
-static void usbexp_request_free(struct usb_request *req, struct usb_ep *ep) 
+static void usbexp_request_free(struct usb_request *req, struct usb_ep *ep)
 {
 	if(req) {
 		kfree(req->buf);
@@ -162,7 +162,7 @@ static inline int _lock(atomic_t *excl)
 {
 	if(atomic_inc_return(excl) == 1) {
 		return 0;
-	} else { 
+	} else {
 		atomic_dec(excl);
 		return -1;
 	}
@@ -216,12 +216,12 @@ static void usbexp_complete_in(struct usb_ep *ep, struct usb_request *req)
 
 static void usbexp_complete_out(struct usb_ep *ep, struct usb_request *req)
 {
-	struct f_usbexp *dev = _f_usbexp; 
+	struct f_usbexp *dev = _f_usbexp;
 
 	dev->rx_done = 1;
 	if(req->status != 0)
 		dev->error = 1;
-	
+
 	wake_up(&dev->read_wq);
 }
 
