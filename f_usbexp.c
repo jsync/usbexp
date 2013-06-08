@@ -225,7 +225,7 @@ static void usbexp_complete_out(struct usb_ep *ep, struct usb_request *req)
 	wake_up(&dev->read_wq);
 }
 
-static int __init create_bulk_endpoints(struct f_usbexp *dev, 
+static int __initcreate_bulk_endpoints(struct f_usbexp *dev,
 		struct usb_endpoint_descriptor *in_desc,
 		struct usb_endpoint_descriptor *out_desc)
 {
@@ -262,9 +262,182 @@ static int __init create_bulk_endpoints(struct f_usbexp *dev,
 		goto fail;
 
 	req->complete = usbexp_complete_out;
+	dev->rx_req = req;
 
+	for(i = 0; i < TX_REQ_MAX; i++) {
+		req = usbexp_request_new(dev->ep_in, BULK_BUFFER_SIZE);
+		if(!req)
+			goto fail;
 
+		req->complete = usbexp_complete_in;
+		req_put(dev, &dev->tx_idle, req);
+	}
+
+	return 0;
+
+fail:
+	printk(KERN_ERR, "usbexp_bind() could not allocate requests\n");
+	return -1;
 }
+
+static ssize_t usbexp_read(struct file *fp, char __user *buf,
+		size_t count, loff_t *pos)
+{
+	struct f_usbexp *dev = fp->private_data;
+	struct usb_composite_dev *cdev = dev->cdev;
+	struct usb_request *req;
+	int r = count, xfer;
+	int ret;
+
+	DBG(cdev, "usbexp_read(%d)\n", count);
+
+	if(count > BULK_BUFFER_SIZE)
+		return -EINVAL;
+
+	if(_lock(&dev->read_excl))
+		return -EBUSY;
+
+	/* we will block until we're online */
+	while(!(dev->online || dev->error)) {
+		DBG(cdev, "usbexp_read: waiting for online state\n");
+		ret = wait_event_interruptible(dev->read_wq, (dev->online || dev->error));
+		if(ret < 0) {
+			_unlock(&dev->read_excl);
+			return ret;
+		}
+	}
+	if(dev->error) {
+		r = -EIO;
+		goto done;
+	}
+
+requeue_req:
+	/* queue a request */
+	req = dev->rx_req;
+	req->length = count;
+	dev->rx_done = 0;
+	ret = usb_ep_queue(dev->ep_out, req, GFP_ATOMIC);
+	if (ret < 0) {
+		DBG(cdev, "usbexp_read: failed to queue req %p (%d)\n", req, ret);
+		r = -EIO;
+		dev->error = 1;
+		goto done;
+	} else {
+		DBG(cdev, "rx %p queue\n", req);
+	}
+
+	/* wait for a request to complete */
+	ret = wait_event_interruptible(dev->read_wq, dev->rx_done);
+	if(ret < 0) {
+		dev->error = 1;
+		r = ret;
+		usb_ep_dequeue(dev->ep_out, req);
+		goto done;
+	}
+
+	if(!dev->error) {
+		/* If we got a 0-len packet, throw it back and try again */
+		if(req->actual == 0)
+			goto requeue_req;
+
+		DBG(cedv, "rx %p %d\n", req, req->acutual);
+		xfer = (req->actual < count ) ? req->actual : count ;
+		if(copy_to_user(buf, req->buf, xfer))
+			r = -EFAULT;
+	} else
+		r = -EIO;
+
+done:
+	_unlock(&dev->read_excl);
+	DBG(cdev, "usbexp_read returning %d\n", r);
+	return r;
+}
+
+static ssize_t usbexp_write(struct file *fp, const char __user *buf,
+		size_t count, loff_t *pos)
+{
+	struct f_usbexp *dev = fp->private_data;
+	struct usb_composite_dev *cdev = dev->cdev;
+	struct usb_request *req = 0;
+	int r = count, xfer;
+	int ret;
+
+	DBG(cdev, "usbexp_write (%d)\n", count);
+
+	if(_lock(&dev->write_excl))
+		return -EBUSY;
+
+	while(count > 0) {
+		if(dev->error) {
+			DBG(cdev, "usbexp_write dev->error\n");
+			r = -EIO;
+			break;
+		}
+
+		/* get an idle tx request to use */
+		req = 0;
+		ret = wait_event_interruptible(dev->write_wq,
+				((req = req_get(dev, &dev->tx_idle)) || dev->error));
+
+		if(ret < 0) {
+			r = ret;
+			break;
+		}
+
+		if(req != 0 ) {
+			if (count > BULK_BUFFER_SIZE)
+				xfer = BULK_BUFFER_SIZE;
+			else
+				xfer = count;
+			if(copy_from_user(req->buf, buf, xfer) {
+				r = -EFAULT;
+				break;
+			}
+			req->length = xfer;
+			ret = usb_ep_queue(dev->ep_in, req, GFP_ATOMIC);
+			if(ret < 0) {
+				DBG(cdev, "usbexp_write: xfer error %d\n", ret);
+				dev->error = 1;
+				r = -EIO;
+				break;
+			}
+
+			buf += xfer;
+			count -= xfer;
+
+			/* zero this so we don't try it on error exit */
+			req = 0;
+		}
+	}
+	if(req)
+		req_put(dev, &dev->tx_idle, req);
+
+	_unlock(&dev->write_excl);
+	DBG(cdev, "usbexp_write returning %d\n", r);
+	return r;
+}
+static int usbexp_open(struct inode *ip, struct file *fp)
+{
+	printk(KERN_INFO "usbexp_open\n");
+	if (_lock(&_f_usbexp->open_excl))
+		return -EBUSY;
+
+	fp->private_data = _f_usbexp;
+
+	/* clear the error latch */
+	_f_usbexp->error = 0;
+
+	return 0;
+}
+
+static int usbexp_release(struct inode *ip, struct file *fp)
+{
+	printk(KERN_INFO "usbexp_release\n");
+	_unlock(&_f_usbexp->open_excl);
+	return 0;
+}
+
+
 static struct android_usb_function usbexp_function = {
 		.name			= "usbexp",
 		.bind_config	= usbexp_bind_config,
