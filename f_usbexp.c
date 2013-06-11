@@ -225,7 +225,7 @@ static void usbexp_complete_out(struct usb_ep *ep, struct usb_request *req)
 	wake_up(&dev->read_wq);
 }
 
-static int __initcreate_bulk_endpoints(struct f_usbexp *dev,
+static int __init create_bulk_endpoints(struct f_usbexp *dev,
 		struct usb_endpoint_descriptor *in_desc,
 		struct usb_endpoint_descriptor *out_desc)
 {
@@ -389,7 +389,7 @@ static ssize_t usbexp_write(struct file *fp, const char __user *buf,
 				xfer = BULK_BUFFER_SIZE;
 			else
 				xfer = count;
-			if(copy_from_user(req->buf, buf, xfer) {
+			if(copy_from_user(req->buf, buf, xfer)){
 				r = -EFAULT;
 				break;
 			}
@@ -437,6 +437,221 @@ static int usbexp_release(struct inode *ip, struct file *fp)
 	return 0;
 }
 
+/* file operations for usbexp device /dev/android_usbexp */
+static struct file_operatiosn usbexp_fops = {
+	.owner		= THIS_MODULE, 
+	.read		= usbexp_read,
+	.write		= usbexp_write,
+	.open		= usbexp_open, 
+	.release	= usbexp_release, 
+};
+
+static struct miscdevice usbexp_device = {
+	.minor		= MISC_DYNAMIC_MINOR,
+	.name		= shortname, 
+	.fops		= &usbexp_fops,
+};
+
+static int usbexp_enable_open(struct inode *ip, struct file *fp)
+{
+	if(atomic_inc_return(&usbexp_enable_excl) != 1) {
+		atomic_dec(&usbexp_enable_excl);
+		return -EBUSY;
+	}
+
+	printk(KERN_INFO "Enabling usbexp\n");
+	android_enable_functions(&_f_usbexp->function, 1);
+
+	return 0;
+}
+
+static int usbexp_enable_release(struct inode *ip, struct file *fp)
+{
+	printk(KERN_INFO "Disabling usbexp\n");
+	android_enable_function(&_f_usbexp->function, 0);
+	atomic_dev(&usbexp_enable_excl);
+	return 0;
+}
+
+static const struct file_operations usbexp_enable_fops = {
+	.owner		= THIS_MODULE, 
+	.open		= usbexp_enable_open,
+	.release	= usbexp_enable_release,
+};
+
+static struct miscdevice usbexp_enable_device = {
+	.minor		= MISC_DYNAMIC_MINOR,
+	.name		= "android_usbexp_enable",
+	.fops		= usbexp_enable_fops,
+};
+
+static int usbexp_function_bind(struct usb_configuration *c, struct usb_function *f)
+{
+	struct usb_composite_dev *cdev = c->cdev;
+	struct f_usbexp *dev = func_to_dev(f);
+	int id, ret;
+
+	dev->cdev = cdev;
+	DBG(cdev, "usbexp_function_bind: %p\n", dev);
+
+	/* allocate interface ID(s) */
+	id = usb_interface_id(c, f);
+	if (id < 0)
+		return id;
+
+	usbexp_interface_desc.bInterfaceNumber = id;
+
+	/* allocate endpoints */
+	ret = create_bulk_endpoints(dev, &usbexp_fullspeed_in_desc,
+			&usbexp_fullspeed_out_desc);
+	if (ret)
+		return ret;
+
+	/* support high speed hardware */
+	if (gadget_is_dualspeed(c->cdev->gadget)) {
+		usbexp_highspeed_in_desc.bEndpointAddress =
+			usbexp_fullspeed_in_desc.bEndpointAddress;
+		usbexp_highspeed_out_desc .bEndpointAddress =
+			usbexp_fullspeed_out_desc.bEndpointAddress;
+	}
+
+	DBG(cdev, "%s speed %s: IN/%s, OUT/%s\n",
+			gadget_is_dualspeed(c->cdev->gadget) ? "dual" : "full",
+			f->name, dev->ep_in->name, dev->ep_out->name);
+
+	return 0;
+}
+
+static void usbexp_function_unbind(struct usb_configuration *c, struct usb_function *f)
+
+{
+	struct f_usbexp *dev = func_to_dev(f);
+	struct usb_request *req;
+
+	spin_lock_irq(&dev->lock);
+
+	usbexp_request_free(dev->rx_req, dev->ep_out);
+	while((req = req_get(dev, &dev->tx_idle)))
+		usbexp_request_free(req, dev->ep_in);
+
+	dev->online = 0;
+	dev->error = 1;
+	spin_unlock_irq(&dev->lock);
+
+	misc_deregister(&usbexp_device);
+	misc_deregister(&usbexp_enable_device);
+	kfree(_f_usbexp);
+	_f_usbexp = NULL;
+
+}
+
+static int usbexp_function_set_alt(struct usb_function *f,
+		unsigned intf, unsigned alt)
+{
+	struct f_usbexp *dev = func_to_dev(f);
+	struct usb_composite_dev *cdev = f->config->cdev;
+	int ret;
+
+	DBG(cdev, "usbexp_function_set_alt intf: %d alt: %d\n", intf, alt);
+	ret = usb_ep_enable(dev->ep_in, 
+			ep_choose(cdev->gadget,
+				&usbexp_highspeed_in_desc,
+				&usbexp_fullspeed_in_desc));
+
+	if(ret)
+		return ret;
+
+	ret = usb_ep_enable(dev->ep_out,
+			ep_choose(cdev->gadget, 
+				&usbexp_highspeed_out_desc,
+				&usbexp_fullspeed_out_desc));
+	if(ret) {
+		usb_ep_disable(dev->ep_in);
+		return ret;
+	}
+
+	dev->online = 1;
+
+	/* readers may be blocked waiting for us to go online */
+	wake_up(&dev->read_wq);
+	return 0;
+}
+
+static void usbexp_function_disable(struct usb_function *f)
+{
+	struct f_usbexp *dev = func_to_dev(f);
+	struct usb_composite_dev *cdev = dev->cdev;
+
+	DBG(cdev, "usbexp_function_disable\n");
+	dev->online = 0;
+	dev->error = 1;
+	usb_ep_disable(dev->ep_in);
+	usb_ep_disable(dev->ep_out);
+
+	/* Readers may be blocked waiting for us to go online */
+	wake_up(&dev->read_wq);
+
+	VDBG(cdev, "%s disabled\n", dev->function.name);
+}
+
+static int usbexp_bind_config(struct usb_configuration *c)
+{
+	struct f_usbexp *dev;
+	int ret;
+
+	printk(KERN_INFO "usbexp_bind_config\n");
+
+	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	if (!dev)
+		return -ENOMEM;
+
+	spin_lock_init(&dev->lock);
+
+	init_waitqueue_head(dev->read_wq);
+	init_waitqueue_head(dev->write_wq);
+
+	atomic_set(&dev->open_excl, 0);
+	atomic_set(&dev->read_excl, 0);
+	atomic_set(&dev->write_excl, 0);
+
+	INIT_LIST_HEAD(&dev->tx_idle);
+
+	dev->cdev = c->cdev;
+	dev->function.name = "usbexp";
+	dev->function.descriptors = fs_usbexp_desc;
+	dev->function.hs_descriptors = hs_usbexp_desc;
+	dev->function.bind = usbexp_function_bind;
+	dev->function.unbind = usbexp_function_unbind;
+	dev->function.set_alt = usbexp_function_set_alt;
+	dev->function.disable = usbexp_function_disable;
+
+	/* start disabled */
+	dev->function.disabled = 1;
+
+	/* _f_usbexp must be set before calling usb_gadget_register_driver */
+	_f_usbexp = dev;
+
+	ret = misc_register(&usbexp_device);
+	if(ret)
+		goto err1;
+	ret = misc_register(&usbexp_enable_device);
+	if(ret)
+		goto err2;
+	ret = usb_add_function(c, &dev->function);
+	if(ret)
+		goto err3;
+
+	return 0;
+
+err3:
+	misc_deregister(&usbexp_enable_device);
+err2:
+	misc_deregister(&usbexp_device);
+err1:
+	kfree(dev);
+	printk(KERN_ERR "usbexp gadget driver failed to initialize \n");
+	return ret;
+}
 
 static struct android_usb_function usbexp_function = {
 		.name			= "usbexp",
@@ -446,6 +661,7 @@ static struct android_usb_function usbexp_function = {
 static int __init init(void)
 {
 	printk(KERN_INFO "f_usbexp init\n");
+	android_register_function(&usbexp_function);
 	return 0;
 }
 
