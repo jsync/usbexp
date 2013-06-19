@@ -71,13 +71,13 @@ struct f_usbexp {
 };
 
 
-static struct usb_interface usbexp_interface_desc = {
+static struct usb_interface_descriptor usbexp_interface_desc = {
 	.bLength		= USB_DT_INTERFACE_SIZE,
 	.bDescriptorType	= USB_DT_INTERFACE,
 	.bInterfaceNumber       = 0,
 	.bNumEndpoints          = 2,
 	.bInterfaceClass        = 0xFF,
-	.bInterfaceSubClass     = 0x42,
+	.bInterfaceSubClass     = 0x43,
 	.bInterfaceProtocol     = 1,
 };
 
@@ -136,7 +136,7 @@ static inline struct f_usbexp *func_to_dev(struct usb_function *f)
 
 static struct usb_request *usbexp_request_new(struct usb_ep *ep, int buffer_size)
 {
-	static usb_request *req = usb_ep_alloc_request(ep, GFP_KERNEL);
+	struct usb_request *req = usb_ep_alloc_request(ep, GFP_KERNEL);
 	if(!req)
 		return NULL;
 
@@ -170,12 +170,12 @@ static inline int _lock(atomic_t *excl)
 
 static inline void _unlock(atomic_t *excl)
 {
-	atomci_dec(excl);
+	atomic_dec(excl);
 
 }
 
 /* Add a request to the tail of a list */
-void req_put(struct f_usbexp *dev, struct list_head *head, struct usb_request *req)
+static void req_put(struct f_usbexp *dev, struct list_head *head, struct usb_request *req)
 {
 	unsigned long flags;
 
@@ -185,7 +185,7 @@ void req_put(struct f_usbexp *dev, struct list_head *head, struct usb_request *r
 }
 
 /* Remove a request from the head of a list */
-struct usb_request *req_get(struct f_usbexp *dev, struct list_head *head)
+static struct usb_request *req_get(struct f_usbexp *dev, struct list_head *head)
 {
 	unsigned long flags;
 	struct usb_request *req;
@@ -242,7 +242,7 @@ static int __init create_bulk_endpoints(struct f_usbexp *dev,
 		return -ENODEV;
 	}
 
-	DBD(cdev, "usb_ep_autoconfig for ep_in got %s\n", ep->name);
+	DBG(cdev, "usb_ep_autoconfig for ep_in got %s\n", ep->name);
 	ep->driver_data = dev;		/* claim the endpoint */
 	dev->ep_in = ep;
 
@@ -257,7 +257,7 @@ static int __init create_bulk_endpoints(struct f_usbexp *dev,
 	dev->ep_out = ep;
 
 	/* now allocate requests for our endpoints */
-	req = adb_request_new(dev->ep_out, BULK_BUFFER_SIZE);
+	req = usbexp_request_new(dev->ep_out, BULK_BUFFER_SIZE);
 	if(!req)
 		goto fail;
 
@@ -276,7 +276,7 @@ static int __init create_bulk_endpoints(struct f_usbexp *dev,
 	return 0;
 
 fail:
-	printk(KERN_ERR, "usbexp_bind() could not allocate requests\n");
+	printk(KERN_ERR "usbexp_bind() could not allocate requests\n");
 	return -1;
 }
 
@@ -340,7 +340,7 @@ requeue_req:
 		if(req->actual == 0)
 			goto requeue_req;
 
-		DBG(cedv, "rx %p %d\n", req, req->acutual);
+		DBG(cdev, "rx %p %d\n", req, req->actual);
 		xfer = (req->actual < count ) ? req->actual : count ;
 		if(copy_to_user(buf, req->buf, xfer))
 			r = -EFAULT;
@@ -438,7 +438,7 @@ static int usbexp_release(struct inode *ip, struct file *fp)
 }
 
 /* file operations for usbexp device /dev/android_usbexp */
-static struct file_operatiosn usbexp_fops = {
+static struct file_operations usbexp_fops = {
 	.owner		= THIS_MODULE, 
 	.read		= usbexp_read,
 	.write		= usbexp_write,
@@ -460,7 +460,7 @@ static int usbexp_enable_open(struct inode *ip, struct file *fp)
 	}
 
 	printk(KERN_INFO "Enabling usbexp\n");
-	android_enable_functions(&_f_usbexp->function, 1);
+	android_enable_function(&_f_usbexp->function, 1);
 
 	return 0;
 }
@@ -469,7 +469,7 @@ static int usbexp_enable_release(struct inode *ip, struct file *fp)
 {
 	printk(KERN_INFO "Disabling usbexp\n");
 	android_enable_function(&_f_usbexp->function, 0);
-	atomic_dev(&usbexp_enable_excl);
+	atomic_dec(&usbexp_enable_excl);
 	return 0;
 }
 
@@ -482,7 +482,7 @@ static const struct file_operations usbexp_enable_fops = {
 static struct miscdevice usbexp_enable_device = {
 	.minor		= MISC_DYNAMIC_MINOR,
 	.name		= "android_usbexp_enable",
-	.fops		= usbexp_enable_fops,
+	.fops		= &usbexp_enable_fops,
 };
 
 static int usbexp_function_bind(struct usb_configuration *c, struct usb_function *f)
@@ -607,8 +607,8 @@ static int usbexp_bind_config(struct usb_configuration *c)
 
 	spin_lock_init(&dev->lock);
 
-	init_waitqueue_head(dev->read_wq);
-	init_waitqueue_head(dev->write_wq);
+	init_waitqueue_head(&dev->read_wq);
+	init_waitqueue_head(&dev->write_wq);
 
 	atomic_set(&dev->open_excl, 0);
 	atomic_set(&dev->read_excl, 0);
