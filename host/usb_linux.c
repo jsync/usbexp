@@ -21,60 +21,14 @@
  * limitations under the License.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <string.h>
-
-#include <sys/ioctl.h>
-#include <sys/types.h>
-#include <sys/time.h>
-#include <dirent.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <ctype.h>
-
-#include <linux/usbdevice_fs.h>
-#include <linux/version.h>
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
-#include <linux/usb/ch9.h>
-#else
-#include <linux/usb_ch9.h>
-#endif
-#include <asm/byteorder.h>
-
+#include "usbexp.h"
 #include <pthread.h>
+#include <signal.h>
+
+void usb_kick(usb_handle *h);
 
 pthread_mutex_t usb_lock = PTHREAD_MUTEX_INITIALIZER;
 
-struct usb_handle {
-	usb_handle *prev;
-	usb_handle *next;
-
-	char fname[64];
-	int desc;
-	unsigned char ep_in;
-	unsigned char ep_out;
-
-	unsigned zero_mask;
-	unsigned writeable;
-
-	struct usbdevfs_urb urb_in;
-	struct usbdevfs_urb urb_out;
-
-	int urb_in_busy;
-	int urb_out_busy;
-	int dead;
-
-	pthread_cond_t notify;
-	pthread_mutex_t lock;
-
-	//for garbage collecting disconnected devices
-	int mark;
-
-	//ID for thread currently in REAPURB
-	pthread_t reaper_thread;
-};
 
 static usb_handle handle_list = {
 		.prev = &handle_list,
@@ -141,7 +95,7 @@ static void find_usb_device(const char *base,
 	while((de =readdir(busdir)) != 0) {
 		if(badname(de->d_name)) continue;
 
-		snprintf(busname, sizeof(busnname), "%s/%s", base, de->d_name);
+		snprintf(busname, sizeof(busname), "%s/%s", base, de->d_name);
 		devdir = opendir(busname);
 		if(devdir == 0) continue;
 
@@ -160,8 +114,8 @@ static void find_usb_device(const char *base,
 			if(badname(de->d_name)) continue;
 			snprintf(devname, sizeof(devname), "%s/%s", busname, de->d_name);
 
-			if(known_device(dev_name)) {
-				DBGX("skipping %s\n", devname);
+			if(known_device(devname)) {
+				D("skipping %s\n", devname);
 				continue;
 			}
 			if((fd = open(devname, O_RDONLY)) < 0) {
@@ -189,12 +143,12 @@ static void find_usb_device(const char *base,
 			vid = __le16_to_cpu(device->idVendor);
 			pid = __le16_to_cpu(device->idProduct);
 			pid = devdesc[10] | (devdesc[11] << 8);
-			DBGX("[ %s is V:%04x P:%04x ]\n", devname, vid, pid);
+			D("[ %s is V:%04x P:%04x ]\n", devname, vid, pid);
 
 			//should have config descriptor next
 			config = (struct usb_config_descriptor*)bufptr;
 			bufptr += USB_DT_CONFIG_SIZE;
-			if(config->bLength ! = USB_DT_CONFIG_SIZE || config->bDescriptorType != USB_DT_CONFIG) {
+			if(config->bLength != USB_DT_CONFIG_SIZE || config->bDescriptorType != USB_DT_CONFIG) {
 				D("usb_config_descriptor not found\n");
 				close(fd);
 				continue;
@@ -214,23 +168,23 @@ static void find_usb_device(const char *base,
 						break;
 					}
 
-					DBGX("bInterfaceClass: %d, bInterfaceSubClass: %d,"
+					D("bInterfaceClass: %d, bInterfaceSubClass: %d,"
 							"bInterfaceProtocol: %d, bNumEndpoints: %d\n",
 							interface->bInterfaceClass, interface->bInterfaceSubClass,
-							interaface->bInterfaceProtocol, interface->bNumEndpoints);
+							interface->bInterfaceProtocol, interface->bNumEndpoints);
 
 					if(interface->bNumEndpoints == 2 &&
 							is_usbexp_interface(vid, pid, interface->bInterfaceClass,
 								interface->bInterfaceSubClass, interface->bInterfaceProtocol)) {
 
-						DBGX("looking for bulk endpoints\n");
+						D("looking for bulk endpoints\n");
 						// looks like usbexp
 						ep1 = (struct usb_endpoint_descriptor *)bufptr;
 						bufptr += USB_DT_ENDPOINT_SIZE;
 						ep2 = (struct usb_endpoint_descriptor *)bufptr;
 						bufptr += USB_DT_ENDPOINT_SIZE;
 
-						if(bufptr > devdesc | desclength ||
+						if(bufptr > devdesc + desclength ||
 							ep1->bLength != USB_DT_ENDPOINT_SIZE ||
 							ep1->bDescriptorType != USB_DT_ENDPOINT ||
 							ep2->bLength != USB_DT_ENDPOINT_SIZE ||
@@ -252,7 +206,7 @@ static void find_usb_device(const char *base,
 						}
 
 						//we have a match. now we just need to figure out which is in and which is out
-						if (ep1->EndPointAddress & USB_ENDPOINT_DIR_MASK) {
+						if (ep1->bEndpointAddress & USB_ENDPOINT_DIR_MASK) {
 							local_ep_in = ep1->bEndpointAddress;
 							local_ep_out = ep2->bEndpointAddress;
 						} else {
@@ -292,9 +246,9 @@ static int usb_bulk_write(usb_handle *h, const void *data, int len)
 	urb->endpoint = h->ep_out;
 	urb->status = -1;
 	urb->buffer = (void*)data;
-	urb->buffer_len;
+	urb->buffer_length = len;
 
-	D("++ write ++\n");
+	//D("++ write ++\n");
 	pthread_mutex_lock(&h->lock);
 	if(h->dead) {
 		res = -1;
@@ -320,7 +274,7 @@ static int usb_bulk_write(usb_handle *h, const void *data, int len)
 			break;
 		}
 
-		if(h0>urb_out_busy == 0) {
+		if(h->urb_out_busy == 0) {
 			if(urb->status == 0) {
 				res = urb->actual_length;
 			}
@@ -329,6 +283,7 @@ static int usb_bulk_write(usb_handle *h, const void *data, int len)
 	}
 fail:
 	pthread_mutex_unlock(&h->lock);
+	//D("-- write -- \n");
 	return res;
 }
 
@@ -360,7 +315,7 @@ static int usb_bulk_read(usb_handle *h, void *data, int len)
 
 	h->urb_in_busy = 1;
 	for(;;) {
-		D("[ reap urb - wait]\n");
+	//	D("[ reap urb - wait]\n");
 		h->reaper_thread = pthread_self();
 		pthread_mutex_unlock(&h->lock);
 		res = ioctl(h->desc, USBDEVFS_REAPURB, &out);
@@ -376,10 +331,10 @@ static int usb_bulk_read(usb_handle *h, void *data, int len)
 			D("[ reap urb - error]\n");
 			break;
 		}
-		D("[ urb @%p status = %d, actual = %d]\n",
-				out, out->status, out->actual_length);
+	/*	D("[ urb @%p status = %d, actual = %d]\n",
+				out, out->status, out->actual_length);*/
 		if(out == &h->urb_in) {
-			D("[ reap urb - IN complete ]\n");
+	//		D("[ reap urb - IN complete ]\n");
 			h->urb_in_busy = 0;
 			if(urb->status == 0) {
 				res = urb->actual_length;
@@ -389,7 +344,7 @@ static int usb_bulk_read(usb_handle *h, void *data, int len)
 			break;
 		}
 		if(out == &h->urb_out) {
-			D("[ reap urb - OUT complete ]\n");
+	//		D("[ reap urb - OUT complete ]\n");
 			h->urb_out_busy = 0;
 			pthread_cond_broadcast(&h->notify);
 		}
@@ -438,15 +393,15 @@ int usb_read(usb_handle *h, void *_data, int len)
 	unsigned char *data = (unsigned char *) _data;
 	int n;
 
-	D("++ usb_read ++\n");
+//	D("++ usb_read ++\n");
 	while(len > 0) {
 		int xfer = (len > 4096) ? 4096 : len ;
 
-		D("[ usb_read %d fd = %d], fname = %s\n", xfer, h->desc, h->fname);
+//		D("[ usb_read %d fd = %d], fname = %s\n", xfer, h->desc, h->fname);
 		n = usb_bulk_read(h, data, xfer);
-		D("[ usb_read %d ] = %d, fname = %s\n", xfer, n, h->fname);
+//		D("[ usb_read %d ] = %d, fname = %s\n", xfer, n, h->fname);
 		if(n != xfer){
-			if((errno == ETIMEOUT) && (h->desc != -1)) {
+			if((errno == ETIMEDOUT) && (h->desc != -1)) {
 				D("[ timeout ]\n");
 				if(n > 0) {
 					data += n;
@@ -461,7 +416,7 @@ int usb_read(usb_handle *h, void *_data, int len)
 		len -= xfer;
 		data += xfer;
 	}
-	D("-- usb_read --\n");
+//	D("-- usb_read --\n");
 	return 0;
 }
 
@@ -504,7 +459,7 @@ void usb_kick(usb_handle *h)
 int usb_close(usb_handle *h)
 {
 	D("[ usb_close ...]\n");
-	pthread_mutex(&h->lock);
+	pthread_mutex_lock(&h->lock);
 	h->next->prev = h->prev;
 	h->prev->next = h->next;
 	h->prev = 0;
@@ -550,7 +505,7 @@ static void register_device(const char *dev_name,
 	usb->ep_in = ep_in;
 	usb->ep_out = ep_out;
 	usb->zero_mask = zero_mask;
-	usb_writeable = 1;
+	usb->writeable = 1;
 
 	pthread_cond_init(&usb->notify, 0);
 	pthread_mutex_init(&usb->lock, 0);
@@ -558,16 +513,18 @@ static void register_device(const char *dev_name,
 	usb->mark = 1;
 	usb->reaper_thread = 0;
 
-	usb->desc = unix_open(usb->fname, O_RDWR);
+	usb->desc = open(usb->fname, O_RDWR);
+
 	if(usb->desc < 0) {
 		/* if we fail, see if have read-only access */
-		usb->desc = unix_open(usb->fname, O_RDONLY);
+		usb->desc = open(usb->fname, O_RDONLY);
 		if(usb->desc < 0) goto fail;
 		usb->writeable = 0;
 		D("[ usb open read_only %s fd = %d]\n", usb->fname, usb->desc);
 	} else {
 		D("[ usb open %s fd = %d]\n", usb->fname, usb->desc);
-		n = ioctl(usb->desc, USBDEVFS_CLAIMINTERFACE, &inteface);
+		n = ioctl(usb->desc, USBDEVFS_CLAIMINTERFACE, &interface);
+		D("[ioctl USBDEVFS_CLAIMINTERFACE n = %d ]", n);
 		if (n != 0) goto fail;
 	}
 
@@ -593,6 +550,7 @@ static void register_device(const char *dev_name,
 		ctrl.data = languages;
 
 		result = ioctl(usb->desc, USBDEVFS_CONTROL, &ctrl);
+		D("[ioctl USBDEVFS_CONTROL result = %d line = %d]\n", result, __LINE__);
 		if(result > 0)
 			languageCount = (result -2) / 2;
 		for(i = 1; i <= languageCount; i++) {
@@ -606,6 +564,7 @@ static void register_device(const char *dev_name,
 			ctrl.data = buffer;
 
 			result = ioctl(usb->desc, USBDEVFS_CONTROL, &ctrl);
+			D("[ioctl USBDEVFS_CONTROL result = %d line = %d]\n", result, __LINE__);
 			if(result > 0) {
 				int i;
 				// skip first word, and copy the rest to the serial strings changing shorts to bytes.
@@ -627,7 +586,8 @@ static void register_device(const char *dev_name,
 	usb->next->prev = usb;
 	pthread_mutex_unlock(&usb_lock);
 	/* need to define for our use and remove the comment */
-	//register_usb_transport(usb, serial, usb->writeable);
+	register_usb_transport(usb);
+	D("[register_usb_transport]\n");
 	return;
 
 fail:
@@ -670,7 +630,7 @@ void usb_init()
 	actions.sa_handler = sigalrm_handler;
 	sigaction(SIGALRM, &actions, NULL);
 
-	if(pthread_create(tid, &attr, device_poll_thread, NULL)) {
-		fatal_errno("cannot create input thread\n");
+	if(pthread_create(&tid, &attr, device_poll_thread, NULL)) {
+		D("cannot create input thread errno = %d (%s)\n", errno, strerror(errno));
 	}
 }

@@ -599,7 +599,7 @@ static int usbexp_bind_config(struct usb_configuration *c)
 	struct f_usbexp *dev;
 	int ret;
 
-	printk(KERN_INFO "usbexp_bind_config\n");
+	printk(KERN_ERR "usbexp_bind_config\n");
 
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
 	if (!dev)
@@ -626,7 +626,7 @@ static int usbexp_bind_config(struct usb_configuration *c)
 	dev->function.disable = usbexp_function_disable;
 
 	/* start disabled */
-	dev->function.disabled = 1;
+	dev->function.disabled = 0;
 
 	/* _f_usbexp must be set before calling usb_gadget_register_driver */
 	_f_usbexp = dev;
